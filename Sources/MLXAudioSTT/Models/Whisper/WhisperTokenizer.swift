@@ -128,6 +128,11 @@ public final class WhisperTokenizer {
         return nil
     }
 
+    /// Token IDs of plain text, without special tokens (for an initial prompt).
+    public func encode(text: String) -> [Int] {
+        inner.encode(text: text, addSpecialTokens: false)
+    }
+
     /// Decode token IDs to text, stripping every Whisper special / timestamp token.
     public func decode(tokens: [Int]) -> String {
         let filtered = tokens.filter { id in

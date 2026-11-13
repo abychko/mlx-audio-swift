@@ -12,6 +12,9 @@ public final class WhisperModel: Module, STTGenerationModel {
 
     private var tokenizer: WhisperTokenizer?
 
+    /// Text decoded before the transcript, like `initial_prompt` in openai/whisper.
+    public var initialPrompt = ""
+
     public init(config: WhisperConfig, generationConfig: WhisperGenerationConfig? = nil) {
         self.config = config
         self.generationConfig = generationConfig
@@ -255,11 +258,16 @@ public final class WhisperModel: Module, STTGenerationModel {
         let encoderHidden = model.encoder(features)
 
         var caches = (0..<config.decoderLayers).map { _ in WhisperLayerCache() }
-        let promptIds = tokenizer.buildPromptTokens(
+        var promptIds = tokenizer.buildPromptTokens(
             language: generationParameters.language,
             task: generationParameters.task,
             withTimestamps: withTimestamps
         )
+        let prompt = initialPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !prompt.isEmpty, let prev = tokenizer.prevSotId {
+            let text = tokenizer.encode(text: " " + prompt)
+            promptIds = [prev] + text.suffix(config.maxTargetPositions / 2 - 1) + promptIds
+        }
 
         let promptArray = MLXArray(promptIds.map(Int32.init)).expandedDimensions(axis: 0)
         var hidden = model.decoder(
@@ -356,10 +364,11 @@ public final class WhisperModel: Module, STTGenerationModel {
         {
             onTokenDelta(delta)
         }
-        // The language token sits at prompt index 1 for multilingual models.
+        // The language token follows <|startoftranscript|> for multilingual models.
         var language: String? = nil
-        if tokenizer.isMultilingual, promptIds.count > 1 {
-            let langTokenId = promptIds[1]
+        let sot = promptIds.firstIndex(of: tokenizer.startOfTranscriptId) ?? 0
+        if tokenizer.isMultilingual, promptIds.count > sot + 1 {
+            let langTokenId = promptIds[sot + 1]
             for (code, id) in tokenizer.languageToId where id == langTokenId {
                 language = code
                 break
