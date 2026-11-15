@@ -15,6 +15,12 @@ public final class WhisperModel: Module, STTGenerationModel {
     /// Text decoded before the transcript, like `initial_prompt` in openai/whisper.
     public var initialPrompt = ""
 
+    /// Languages detection may choose from when `generationParameters.language` is nil, as
+    /// codes or names ("ru", "Spanish"), each with its prior weight: a language wins when
+    /// the model's probability times the weight is the highest. Empty — any language the
+    /// model knows, equally likely. Each 30 s window is detected on its own.
+    public var languagePriors: [String: Float] = [:]
+
     public init(config: WhisperConfig, generationConfig: WhisperGenerationConfig? = nil) {
         self.config = config
         self.generationConfig = generationConfig
@@ -257,9 +263,14 @@ public final class WhisperModel: Module, STTGenerationModel {
         let features = WhisperAudio.encoderFeatures(audio: audio, nMels: config.numMelBins)
         let encoderHidden = model.encoder(features)
 
+        var spoken = generationParameters.language
+        if tokenizer.isMultilingual, tokenizer.resolveLanguage(spoken) == nil {
+            spoken = detectLanguage(encoderHidden: encoderHidden, tokenizer: tokenizer)
+        }
+
         var caches = (0..<config.decoderLayers).map { _ in WhisperLayerCache() }
         var promptIds = tokenizer.buildPromptTokens(
-            language: generationParameters.language,
+            language: spoken,
             task: generationParameters.task,
             withTimestamps: withTimestamps
         )
@@ -375,6 +386,32 @@ public final class WhisperModel: Module, STTGenerationModel {
             }
         }
         return (generated, promptIds.count, language)
+    }
+
+    /// The most likely language token after `<|startoftranscript|>`, as openai/whisper's
+    /// `detect_language` picks it, weighted by `languagePriors` when they are set.
+    private func detectLanguage(encoderHidden: MLXArray, tokenizer: WhisperTokenizer) -> String? {
+        // Token id → log prior; logits differ from log-probabilities by one constant per step.
+        var bias: [Int: Float] = [:]
+        for (language, weight) in languagePriors where weight > 0 {
+            if let id = tokenizer.resolveLanguage(language) { bias[id] = log(weight) }
+        }
+        var candidates = tokenizer.languageToId
+        if !languagePriors.isEmpty {
+            candidates = candidates.filter { bias[$0.value] != nil }
+        }
+        guard !candidates.isEmpty else { return nil }
+        var caches = (0..<config.decoderLayers).map { _ in WhisperLayerCache() }
+        let hidden = model.decoder(
+            tokens: MLXArray([Int32(tokenizer.startOfTranscriptId)]).expandedDimensions(axis: 0),
+            startPosition: 0,
+            encoderHidden: encoderHidden,
+            caches: &caches
+        )
+        let logits = model.decoder.projectToVocab(hidden[0, -1]).asType(.float32).asArray(Float.self)
+        func score(_ id: Int) -> Float { logits[id] + (bias[id] ?? 0) }
+        return candidates.filter { $0.value < logits.count }
+            .max { score($0.value) < score($1.value) }?.key
     }
 
     private func sample(_ logits: MLXArray, temperature: Float) -> Int {
